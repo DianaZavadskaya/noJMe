@@ -65,7 +65,7 @@ LIBRETRO_SRCS := \
 	$(SRCDIR)/libretro/sdl_backend_stubs.c
 
 # SDL sources (for standalone app only)
-SDL_SRCS := $(wildcard $(SRCDIR)/sdl/*.c)
+SDL_SRCS := $(SRCDIR)/sdl/sdl_graphics.c
 
 ALL_LIBRETRO_SRCS := $(JVM_SRCS) $(MIDP_SRCS) $(UTIL_SRCS) $(MIDI_SRCS) $(LIBRETRO_SRCS)
 ALL_APP_SRCS := $(JVM_SRCS) $(MIDP_SRCS) $(UTIL_SRCS) $(MIDI_SRCS) $(SDL_SRCS) $(SRCDIR)/main.c
@@ -217,7 +217,7 @@ ALL_LIBRETRO_OBJS := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/libretro/%.o,$(ALL_LIBRE
 # Build targets
 # ==============================================
 
-.PHONY: all clean app dirs check info libretro
+.PHONY: all clean app dirs check info libretro headless baseline test
 
 # Default: build libretro core (Windows by default)
 all: libretro
@@ -399,3 +399,14 @@ info:
 	@echo "MIDI:     $(words $(MIDI_SRCS)) files"
 	@echo "Libretro: $(words $(LIBRETRO_SRCS)) files"
 	@echo "Total:    $(words $(ALL_LIBRETRO_SRCS)) files"
+
+# ==============================================
+# Regression oracle targets
+# ==============================================
+
+baseline: headless
+	@mkdir -p tests/baselines
+	@sh tests/capture-baseline.sh
+
+test: headless
+	@sh tests/check-regression.sh

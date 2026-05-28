@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wsl *)",
+      "Bash(node *)",
+      "Bash(python3 *)",
+      "Bash(mkdir -p tests/baselines)",
+      "Bash(./bin/j2me-headless tests/ObfTestSuite.jar 300)",
+      "Bash(tee tests/baselines/ObfTestSuite.sha256)",
+      "Bash(./bin/j2me-headless tests/TestSuite.jar 300)",
+      "Bash(tee tests/baselines/TestSuite.sha256)",
+      "Read(//c/mnt/c/Users/Dziyana_Zavadskaya/Project/ALL/LEARN/AI/migrate/noJMe/js/**)",
+      "Read(//mnt/c/Users/Dziyana_Zavadskaya/Project/ALL/LEARN/AI/migrate/noJMe/js/**)",
+      "Bash(./bin/j2me-headless tests/ClassTest.jar)",
+      "Bash(dir \"C:\\\\Users\\\\Dziyana_Zavadskaya\\\\Project\\\\ALL\\\\LEARN\\\\AI\\\\migrate\\\\noJMe\")"
+    ]
+  }
+}

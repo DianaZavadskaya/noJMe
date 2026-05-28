@@ -1,0 +1,29 @@
+/**
+ * STB Image Implementation - JavaScript ESM port
+ * Migrated from src/utils/stb_image_impl.c (35 lines)
+ *
+ * Replicated public surface from stb_image.h:
+ *   stbi_load_from_memory, stbi_load, stbi_image_free,
+ *   stbi_failure_reason, stbi_info_from_memory
+ *
+ * Translation decisions:
+ *   - PNG: pure-JS decoder using Node.js built-in zlib.inflateSync
+ *   - JPEG: baseline-DCT pure-JS decoder (8-bit, non-progressive, YCbCr/grey)
+ *   - BMP: pure-JS 24-bpp and 32-bpp uncompressed DIB
+ *   - stbi_image_free: no-op (GC)
+ *   - desired_channels 4 (RGBA) is the primary tested path
+ */
+
+import { inflateSync } from 'zlib';
+import { readFileSync } from 'fs';
+
+// ---------------------------------------------------------------------------
+// Module-level last-error state
+// ---------------------------------------------------------------------------
+let _failureReason = '';
+
+function _fail(msg) { _failureReason = msg; return null; }
+
+export function stbi_failure_reason() { return _failureReason; }
+
+export function stbi_image_free(_pixels) { /* GC handles deallocation */ }

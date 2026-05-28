@@ -1,0 +1,945 @@
+/*
+ * sdl_backend_stubs.mjs
+ * SDL2 function replacements for the libretro build.
+ * Migrated from src/libretro/sdl_backend_stubs.c
+ *
+ * Audio thread (pthread) → setInterval-based background generation.
+ * pthread_mutex / atomic → plain JS (single-threaded event loop).
+ * Framebuffer buffers  → Uint32Array pair.
+ * ZIP decompression    → pako (inline port) or Node.js zlib.
+ */
+
+import { inflateRawSync } from 'node:zlib';
+
+// ---------------------------------------------------------------------------
+// Libretro callback injection
+// ---------------------------------------------------------------------------
+
+/** @type {{ video_cb, audio_batch_cb, input_poll_cb, input_state_cb, environ_cb,
+ *           get_framebuffer, get_screen_width, get_screen_height, get_key_states } | null} */
+let g_callbacks = null;
+
+/**
+ * Inject the libretro callback object.  Call this once before using any
+ * libretro-facing function.
+ *
+ * Expected shape:
+ * {
+ *   video_cb(data, width, height, pitch),
+ *   audio_batch_cb(samples, count) → number,
+ *   input_poll_cb(),
+ *   input_state_cb(port, device, index, id) → number,
+ *   environ_cb(cmd, data) → boolean,
+ *   get_framebuffer()  → Uint32Array,
+ *   get_screen_width() → number,
+ *   get_screen_height() → number,
+ *   get_key_states()   → number,
+ * }
+ */
+export function set_libretro_callbacks(cb) {
+    g_callbacks = cb;
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+export const AUDIO_BUFFER_SIZE  = 8192;
+export const AUDIO_SOURCE_RATE  = 44100;
+const THREAD_AUDIO_BUFFER_SIZE  = 4096;
+const BUFFER_COUNT              = 2;
+
+// Font dimensions (from bitmap_font.h)
+const FONT_WIDTH  = 5;
+const FONT_HEIGHT = 7;
+
+// ---------------------------------------------------------------------------
+// Bitmap font data (inlined from src/midp/bitmap_font.h)
+// ---------------------------------------------------------------------------
+
+const FONT_RANGE1_START = 0x20;
+const FONT_RANGE1_END   = 0x7E;
+const FONT_RANGE1_COUNT = 95;
+const FONT_RANGE2_START = 0xA0;
+const FONT_RANGE2_END   = 0xFF;
+const FONT_RANGE2_COUNT = 96;
+const FONT_RANGE3_START = 0x400;
+const FONT_RANGE3_END   = 0x45F;
+
+/* eslint-disable */
+const bitmap_font = new Uint8Array([
+    // Range 1: Basic ASCII 0x20-0x7E
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x04,0x04,0x04,0x04,0x04,0x00,0x04,
+    0x0A,0x0A,0x0A,0x00,0x00,0x00,0x00, 0x0A,0x0A,0x1F,0x0A,0x1F,0x0A,0x0A,
+    0x04,0x0F,0x14,0x0E,0x05,0x1E,0x04, 0x18,0x19,0x02,0x04,0x08,0x13,0x03,
+    0x08,0x14,0x14,0x08,0x15,0x12,0x0D, 0x04,0x04,0x08,0x00,0x00,0x00,0x00,
+    0x02,0x04,0x08,0x08,0x08,0x04,0x02, 0x08,0x04,0x02,0x02,0x02,0x04,0x08,
+    0x04,0x15,0x0E,0x1F,0x0E,0x15,0x04, 0x00,0x04,0x04,0x1F,0x04,0x04,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x04,0x08, 0x00,0x00,0x00,0x1F,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x04,0x04, 0x00,0x01,0x02,0x04,0x08,0x10,0x00,
+    0x0E,0x11,0x13,0x15,0x19,0x11,0x0E, 0x04,0x0C,0x04,0x04,0x04,0x04,0x0E,
+    0x0E,0x11,0x01,0x06,0x08,0x10,0x1F, 0x0E,0x11,0x01,0x06,0x01,0x11,0x0E,
+    0x02,0x06,0x0A,0x12,0x1F,0x02,0x02, 0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E,
+    0x06,0x08,0x10,0x1E,0x11,0x11,0x0E, 0x1F,0x01,0x02,0x04,0x08,0x08,0x08,
+    0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E, 0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C,
+    0x00,0x04,0x04,0x00,0x04,0x04,0x00, 0x00,0x04,0x04,0x00,0x04,0x08,0x00,
+    0x02,0x04,0x08,0x10,0x08,0x04,0x02, 0x00,0x00,0x1F,0x00,0x1F,0x00,0x00,
+    0x08,0x04,0x02,0x01,0x02,0x04,0x08, 0x0E,0x11,0x01,0x02,0x04,0x00,0x04,
+    0x0E,0x11,0x17,0x15,0x17,0x10,0x0E, 0x0E,0x11,0x11,0x11,0x1F,0x11,0x11,
+    0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E, 0x0E,0x11,0x10,0x10,0x10,0x11,0x0E,
+    0x1E,0x11,0x11,0x11,0x11,0x11,0x1E, 0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F,
+    0x1F,0x10,0x10,0x1E,0x10,0x10,0x10, 0x0E,0x11,0x10,0x17,0x11,0x11,0x0F,
+    0x11,0x11,0x11,0x1F,0x11,0x11,0x11, 0x0E,0x04,0x04,0x04,0x04,0x04,0x0E,
+    0x01,0x01,0x01,0x01,0x01,0x11,0x0E, 0x11,0x12,0x14,0x18,0x14,0x12,0x11,
+    0x10,0x10,0x10,0x10,0x10,0x10,0x1F, 0x11,0x1B,0x15,0x15,0x11,0x11,0x11,
+    0x11,0x19,0x15,0x13,0x11,0x11,0x11, 0x0E,0x11,0x11,0x11,0x11,0x11,0x0E,
+    0x1E,0x11,0x11,0x1E,0x10,0x10,0x10, 0x0E,0x11,0x11,0x11,0x15,0x12,0x0D,
+    0x1E,0x11,0x11,0x1E,0x14,0x12,0x11, 0x0E,0x11,0x10,0x0E,0x01,0x11,0x0E,
+    0x1F,0x04,0x04,0x04,0x04,0x04,0x04, 0x11,0x11,0x11,0x11,0x11,0x11,0x0E,
+    0x11,0x11,0x11,0x11,0x11,0x0A,0x04, 0x11,0x11,0x11,0x15,0x15,0x1B,0x11,
+    0x11,0x11,0x0A,0x04,0x0A,0x11,0x11, 0x11,0x11,0x0A,0x04,0x04,0x04,0x04,
+    0x1F,0x01,0x02,0x04,0x08,0x10,0x1F, 0x0E,0x08,0x08,0x08,0x08,0x08,0x0E,
+    0x00,0x10,0x08,0x04,0x02,0x01,0x00, 0x0E,0x02,0x02,0x02,0x02,0x02,0x0E,
+    0x04,0x0A,0x11,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x1F,
+    0x08,0x04,0x02,0x00,0x00,0x00,0x00, 0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F,
+    0x10,0x10,0x1E,0x11,0x11,0x11,0x1E, 0x00,0x00,0x0E,0x11,0x10,0x11,0x0E,
+    0x01,0x01,0x0F,0x11,0x11,0x11,0x0F, 0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E,
+    0x06,0x08,0x08,0x1E,0x08,0x08,0x08, 0x00,0x00,0x0F,0x11,0x11,0x0F,0x01,
+    0x10,0x10,0x1E,0x11,0x11,0x11,0x11, 0x04,0x00,0x0C,0x04,0x04,0x04,0x0E,
+    0x02,0x00,0x06,0x02,0x02,0x02,0x12, 0x10,0x10,0x12,0x14,0x18,0x14,0x12,
+    0x0C,0x04,0x04,0x04,0x04,0x04,0x0E, 0x00,0x00,0x1A,0x15,0x15,0x11,0x11,
+    0x00,0x00,0x1E,0x11,0x11,0x11,0x11, 0x00,0x00,0x0E,0x11,0x11,0x11,0x0E,
+    0x00,0x00,0x1E,0x11,0x11,0x1E,0x10, 0x00,0x00,0x0F,0x11,0x11,0x0F,0x01,
+    0x00,0x00,0x17,0x08,0x08,0x08,0x08, 0x00,0x00,0x0F,0x10,0x0E,0x01,0x1E,
+    0x08,0x08,0x1E,0x08,0x08,0x08,0x06, 0x00,0x00,0x11,0x11,0x11,0x11,0x0F,
+    0x00,0x00,0x11,0x11,0x11,0x0A,0x04, 0x00,0x00,0x11,0x11,0x15,0x15,0x0A,
+    0x00,0x00,0x11,0x0A,0x04,0x0A,0x11, 0x00,0x00,0x11,0x11,0x11,0x0F,0x01,
+    0x00,0x00,0x1F,0x02,0x04,0x08,0x1F, 0x02,0x04,0x04,0x08,0x04,0x04,0x02,
+    0x04,0x04,0x04,0x04,0x04,0x04,0x04, 0x08,0x04,0x04,0x02,0x04,0x04,0x08,
+    0x00,0x00,0x08,0x15,0x02,0x00,0x00,
+    // Range 2: Latin-1 Supplement 0xA0-0xFF
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x04,0x00,0x04,0x04,0x04,0x04,0x04,
+    0x00,0x04,0x0E,0x14,0x10,0x0E,0x04, 0x06,0x08,0x08,0x1E,0x08,0x08,0x1C,
+    0x00,0x11,0x0E,0x0A,0x0E,0x11,0x00, 0x11,0x0A,0x04,0x1F,0x04,0x1F,0x04,
+    0x04,0x04,0x04,0x00,0x04,0x04,0x04, 0x0E,0x10,0x0E,0x11,0x0E,0x01,0x0E,
+    0x0A,0x00,0x00,0x00,0x00,0x00,0x00, 0x0E,0x11,0x15,0x15,0x15,0x11,0x0E,
+    0x06,0x01,0x07,0x00,0x0F,0x00,0x00, 0x00,0x00,0x0A,0x14,0x0A,0x00,0x00,
+    0x00,0x00,0x1F,0x01,0x01,0x00,0x00, 0x00,0x00,0x1F,0x00,0x00,0x00,0x00,
+    0x0E,0x11,0x17,0x15,0x13,0x11,0x0E, 0x1F,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x0E,0x11,0x11,0x0E,0x00,0x00,0x00, 0x04,0x04,0x1F,0x04,0x04,0x00,0x1F,
+    0x0E,0x01,0x06,0x08,0x0F,0x00,0x00, 0x0E,0x01,0x06,0x01,0x0E,0x00,0x00,
+    0x02,0x04,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x12,0x12,0x12,0x1C,0x10,
+    0x07,0x0D,0x15,0x15,0x04,0x04,0x04, 0x00,0x00,0x00,0x04,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x04,0x08, 0x04,0x0C,0x04,0x04,0x07,0x00,0x00,
+    0x0E,0x11,0x11,0x0E,0x00,0x0F,0x00, 0x00,0x00,0x14,0x0A,0x14,0x00,0x00,
+    0x18,0x08,0x09,0x13,0x04,0x03,0x00, 0x18,0x08,0x05,0x12,0x04,0x0B,0x00,
+    0x0C,0x04,0x09,0x13,0x04,0x03,0x00, 0x04,0x00,0x04,0x08,0x10,0x11,0x0E,
+    0x08,0x04,0x0E,0x11,0x1F,0x11,0x11, 0x02,0x04,0x0E,0x11,0x1F,0x11,0x11,
+    0x04,0x0A,0x0E,0x11,0x1F,0x11,0x11, 0x0D,0x12,0x0E,0x11,0x1F,0x11,0x11,
+    0x0A,0x00,0x0E,0x11,0x1F,0x11,0x11, 0x04,0x0A,0x0E,0x11,0x1F,0x11,0x11,
+    0x07,0x08,0x0E,0x0B,0x1E,0x0A,0x1B, 0x0E,0x10,0x10,0x10,0x10,0x0E,0x08,
+    0x08,0x04,0x1F,0x10,0x1E,0x10,0x1F, 0x02,0x04,0x1F,0x10,0x1E,0x10,0x1F,
+    0x04,0x0A,0x1F,0x10,0x1E,0x10,0x1F, 0x0A,0x00,0x1F,0x10,0x1E,0x10,0x1F,
+    0x08,0x04,0x0E,0x04,0x04,0x04,0x0E, 0x02,0x04,0x0E,0x04,0x04,0x04,0x0E,
+    0x04,0x0A,0x0E,0x04,0x04,0x04,0x0E, 0x0A,0x00,0x0E,0x04,0x04,0x04,0x0E,
+    0x0E,0x08,0x08,0x1E,0x08,0x08,0x1C, 0x0D,0x12,0x11,0x19,0x15,0x13,0x11,
+    0x08,0x04,0x0E,0x11,0x11,0x11,0x0E, 0x02,0x04,0x0E,0x11,0x11,0x11,0x0E,
+    0x04,0x0A,0x0E,0x11,0x11,0x11,0x0E, 0x0D,0x12,0x0E,0x11,0x11,0x11,0x0E,
+    0x0A,0x00,0x0E,0x11,0x11,0x11,0x0E, 0x00,0x11,0x0A,0x04,0x0A,0x11,0x00,
+    0x0E,0x11,0x13,0x15,0x19,0x11,0x0E, 0x08,0x04,0x11,0x11,0x11,0x11,0x0E,
+    0x02,0x04,0x11,0x11,0x11,0x11,0x0E, 0x04,0x0A,0x11,0x11,0x11,0x11,0x0E,
+    0x0A,0x00,0x11,0x11,0x11,0x11,0x0E, 0x02,0x04,0x11,0x11,0x0A,0x04,0x04,
+    0x10,0x1E,0x11,0x11,0x1E,0x10,0x10, 0x06,0x09,0x09,0x0A,0x09,0x09,0x06,
+    0x08,0x04,0x0E,0x01,0x0F,0x11,0x0F, 0x02,0x04,0x0E,0x01,0x0F,0x11,0x0F,
+    0x04,0x0A,0x0E,0x01,0x0F,0x11,0x0F, 0x0D,0x12,0x0E,0x01,0x0F,0x11,0x0F,
+    0x0A,0x00,0x0E,0x01,0x0F,0x11,0x0F, 0x04,0x0A,0x0E,0x01,0x0F,0x11,0x0F,
+    0x00,0x00,0x1B,0x05,0x1F,0x14,0x1B, 0x00,0x00,0x0E,0x10,0x10,0x0E,0x08,
+    0x08,0x04,0x0E,0x11,0x1F,0x10,0x0E, 0x02,0x04,0x0E,0x11,0x1F,0x10,0x0E,
+    0x04,0x0A,0x0E,0x11,0x1F,0x10,0x0E, 0x0A,0x00,0x0E,0x11,0x1F,0x10,0x0E,
+    0x08,0x04,0x0C,0x04,0x04,0x04,0x0E, 0x02,0x04,0x0C,0x04,0x04,0x04,0x0E,
+    0x04,0x0A,0x0C,0x04,0x04,0x04,0x0E, 0x0A,0x00,0x0C,0x04,0x04,0x04,0x0E,
+    0x06,0x01,0x07,0x09,0x09,0x09,0x06, 0x0D,0x12,0x1E,0x11,0x11,0x11,0x11,
+    0x08,0x04,0x0E,0x11,0x11,0x11,0x0E, 0x02,0x04,0x0E,0x11,0x11,0x11,0x0E,
+    0x04,0x0A,0x0E,0x11,0x11,0x11,0x0E, 0x0D,0x12,0x0E,0x11,0x11,0x11,0x0E,
+    0x0A,0x00,0x0E,0x11,0x11,0x11,0x0E, 0x00,0x04,0x00,0x1F,0x00,0x04,0x00,
+    0x00,0x00,0x0E,0x13,0x15,0x19,0x0E, 0x08,0x04,0x11,0x11,0x11,0x11,0x0F,
+    0x02,0x04,0x11,0x11,0x11,0x11,0x0F, 0x04,0x0A,0x11,0x11,0x11,0x11,0x0F,
+    0x0A,0x00,0x11,0x11,0x11,0x11,0x0F, 0x02,0x04,0x11,0x11,0x11,0x0F,0x01,
+    0x10,0x1E,0x11,0x11,0x1E,0x10,0x10, 0x0A,0x00,0x11,0x11,0x11,0x0F,0x01,
+    // Range 3: Cyrillic 0x400-0x45F
+    0x08,0x04,0x1F,0x10,0x1E,0x10,0x1F, 0x0A,0x00,0x1F,0x10,0x1E,0x10,0x1F,
+    0x1E,0x08,0x08,0x08,0x08,0x0A,0x04, 0x02,0x04,0x1F,0x10,0x10,0x10,0x10,
+    0x0F,0x10,0x10,0x1E,0x10,0x10,0x0F, 0x0E,0x10,0x10,0x0E,0x01,0x01,0x1E,
+    0x0E,0x04,0x04,0x04,0x04,0x04,0x0E, 0x0A,0x00,0x0E,0x04,0x04,0x04,0x0E,
+    0x01,0x01,0x01,0x01,0x01,0x11,0x0E, 0x12,0x14,0x14,0x14,0x14,0x14,0x18,
+    0x12,0x12,0x12,0x1A,0x16,0x12,0x12, 0x1E,0x08,0x08,0x08,0x08,0x0A,0x04,
+    0x02,0x04,0x11,0x12,0x1C,0x12,0x11, 0x08,0x04,0x11,0x11,0x11,0x11,0x0E,
+    0x04,0x0A,0x11,0x11,0x11,0x13,0x0D, 0x11,0x11,0x11,0x13,0x15,0x19,0x11,
+    0x0E,0x11,0x11,0x11,0x1F,0x11,0x11, 0x1F,0x10,0x1E,0x11,0x11,0x11,0x1E,
+    0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E, 0x1F,0x10,0x10,0x10,0x10,0x10,0x10,
+    0x07,0x09,0x09,0x09,0x09,0x09,0x1F, 0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F,
+    0x15,0x15,0x0E,0x15,0x0E,0x15,0x15, 0x0E,0x11,0x01,0x06,0x01,0x11,0x0E,
+    0x11,0x13,0x15,0x19,0x11,0x11,0x11, 0x04,0x0A,0x13,0x15,0x19,0x11,0x11,
+    0x11,0x12,0x14,0x18,0x14,0x12,0x11, 0x0E,0x12,0x12,0x12,0x12,0x12,0x12,
+    0x11,0x1B,0x15,0x15,0x11,0x11,0x11, 0x11,0x11,0x11,0x1F,0x11,0x11,0x11,
+    0x0E,0x11,0x11,0x11,0x11,0x11,0x0E, 0x1F,0x11,0x11,0x11,0x11,0x11,0x11,
+    0x1E,0x11,0x11,0x1E,0x10,0x10,0x10, 0x0E,0x11,0x10,0x10,0x10,0x11,0x0E,
+    0x1F,0x04,0x04,0x04,0x04,0x04,0x04, 0x11,0x11,0x11,0x0F,0x01,0x11,0x0E,
+    0x04,0x0E,0x15,0x15,0x0E,0x04,0x04, 0x11,0x11,0x0A,0x04,0x0A,0x11,0x11,
+    0x12,0x12,0x12,0x12,0x12,0x12,0x1F, 0x11,0x11,0x11,0x0F,0x01,0x01,0x01,
+    0x15,0x15,0x15,0x15,0x15,0x15,0x1F, 0x15,0x15,0x15,0x17,0x15,0x15,0x19,
+    0x18,0x08,0x08,0x0E,0x08,0x08,0x07, 0x12,0x12,0x12,0x1A,0x12,0x12,0x1B,
+    0x10,0x10,0x10,0x1E,0x11,0x11,0x1E, 0x0E,0x11,0x01,0x0F,0x01,0x11,0x0E,
+    0x16,0x19,0x11,0x1F,0x11,0x11,0x16, 0x0F,0x11,0x11,0x0F,0x05,0x09,0x11,
+    0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F, 0x00,0x00,0x1E,0x11,0x1F,0x10,0x0F,
+    0x00,0x00,0x1E,0x11,0x1E,0x11,0x1E, 0x00,0x00,0x1F,0x10,0x10,0x10,0x10,
+    0x00,0x00,0x07,0x09,0x09,0x09,0x1F, 0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E,
+    0x00,0x00,0x15,0x0E,0x15,0x0E,0x15, 0x00,0x00,0x0E,0x01,0x06,0x01,0x0E,
+    0x00,0x00,0x11,0x13,0x15,0x19,0x11, 0x04,0x0A,0x11,0x13,0x15,0x19,0x11,
+    0x00,0x00,0x11,0x12,0x1C,0x12,0x11, 0x00,0x00,0x0E,0x12,0x12,0x12,0x12,
+    0x00,0x00,0x11,0x1B,0x15,0x11,0x11, 0x00,0x00,0x11,0x11,0x1F,0x11,0x11,
+    0x00,0x00,0x0E,0x11,0x11,0x11,0x0E, 0x00,0x00,0x1F,0x11,0x11,0x11,0x11,
+    0x00,0x00,0x1E,0x11,0x1E,0x10,0x10, 0x00,0x00,0x0E,0x10,0x10,0x10,0x0E,
+    0x00,0x00,0x1F,0x04,0x04,0x04,0x04, 0x00,0x00,0x11,0x11,0x0F,0x01,0x0E,
+    0x00,0x04,0x0E,0x15,0x0E,0x04,0x00, 0x00,0x00,0x11,0x0A,0x04,0x0A,0x11,
+    0x00,0x00,0x12,0x12,0x12,0x12,0x1F, 0x00,0x00,0x11,0x11,0x0F,0x01,0x01,
+    0x00,0x00,0x15,0x15,0x15,0x15,0x1F, 0x00,0x00,0x15,0x15,0x17,0x15,0x19,
+    0x00,0x00,0x18,0x08,0x0E,0x08,0x07, 0x00,0x00,0x12,0x12,0x1A,0x12,0x1B,
+    0x00,0x00,0x10,0x10,0x1E,0x11,0x1E, 0x00,0x00,0x0E,0x01,0x0F,0x01,0x0E,
+    0x00,0x00,0x16,0x19,0x1F,0x11,0x16, 0x00,0x00,0x0F,0x11,0x0F,0x09,0x11,
+    0x08,0x04,0x0E,0x11,0x1F,0x10,0x0E, 0x0A,0x00,0x0E,0x11,0x1F,0x10,0x0E,
+    0x10,0x1E,0x08,0x08,0x08,0x0A,0x04, 0x02,0x04,0x1F,0x10,0x10,0x10,0x10,
+    0x00,0x00,0x0F,0x10,0x1E,0x10,0x0F, 0x00,0x00,0x0E,0x10,0x0E,0x01,0x1E,
+    0x00,0x00,0x0E,0x04,0x04,0x04,0x0E, 0x0A,0x00,0x0E,0x04,0x04,0x04,0x0E,
+    0x00,0x00,0x01,0x01,0x01,0x11,0x0E, 0x00,0x00,0x12,0x14,0x14,0x14,0x18,
+    0x00,0x00,0x12,0x12,0x1A,0x16,0x12, 0x10,0x1E,0x08,0x08,0x08,0x0A,0x04,
+    0x02,0x04,0x11,0x12,0x1C,0x12,0x11, 0x08,0x04,0x11,0x11,0x11,0x11,0x0E,
+    0x04,0x0A,0x11,0x11,0x13,0x0D,0x01, 0x00,0x00,0x11,0x11,0x13,0x15,0x11,
+]);
+/* eslint-enable */
+
+function get_char_data_unicode(cp) {
+    if (cp >= FONT_RANGE1_START && cp <= FONT_RANGE1_END)
+        return bitmap_font.subarray((cp - FONT_RANGE1_START) * FONT_HEIGHT);
+    if (cp >= FONT_RANGE2_START && cp <= FONT_RANGE2_END)
+        return bitmap_font.subarray((FONT_RANGE1_COUNT + cp - FONT_RANGE2_START) * FONT_HEIGHT);
+    if (cp >= FONT_RANGE3_START && cp <= FONT_RANGE3_END)
+        return bitmap_font.subarray((FONT_RANGE1_COUNT + FONT_RANGE2_COUNT + cp - FONT_RANGE3_START) * FONT_HEIGHT);
+    return bitmap_font.subarray(0);
+}
+
+function utf8_decode(str, idx) {
+    const c = str.codePointAt(idx);
+    if (c === undefined) return { cp: -1, next: idx + 1 };
+    const len = c > 0xFFFF ? 2 : 1;
+    return { cp: c, next: idx + len };
+}
+
+// ---------------------------------------------------------------------------
+// Audio state
+// ---------------------------------------------------------------------------
+
+let g_audio_initialized = false;
+let g_frontend_sample_rate = 22050;
+let g_audio_resample_ratio = 1.0;
+let g_audio_resample_pos   = 0.0;
+let g_last_frame_time      = 0;
+let g_audio_time_accumulator = 0.0;
+
+// Legacy ring buffer (plain arrays — JS GC-managed)
+const g_audio_buffer = new Int16Array(AUDIO_BUFFER_SIZE * 2);
+let g_audio_write_pos = 0;
+let g_audio_read_pos  = 0;
+let g_audio_count     = 0;
+
+// Ring buffer for audio thread ↔ main thread exchange
+const g_ring_buf = new Int16Array(AUDIO_BUFFER_SIZE * 2);
+let g_ring_write = 0;
+let g_ring_read  = 0;
+let g_ring_count = 0;
+
+// Audio thread handle (setInterval id)
+let g_audio_interval_id = null;
+let g_audio_thread_running = false;
+
+// External media_generate_audio_samples callback (injected by caller)
+let g_generate_audio_fn = null;
+
+/**
+ * Register the audio generation callback (replaces the extern declaration).
+ * @param {function(number):void} fn  - media_generate_audio_samples(samples)
+ */
+export function set_audio_generate_fn(fn) {
+    g_generate_audio_fn = fn;
+}
+
+function audio_get_time_us() {
+    return Math.round(performance.now() * 1000);
+}
+
+function audio_ring_write(samples, count) {
+    if (!samples || count === 0) return 0;
+    let written = 0;
+    for (let i = 0; i < count && g_ring_count < AUDIO_BUFFER_SIZE; i++) {
+        g_ring_buf[g_ring_write * 2]     = samples[i * 2];
+        g_ring_buf[g_ring_write * 2 + 1] = samples[i * 2 + 1];
+        g_ring_write = (g_ring_write + 1) % AUDIO_BUFFER_SIZE;
+        g_ring_count++;
+        written++;
+    }
+    return written;
+}
+
+function audio_ring_read(out, count) {
+    let read_count = 0;
+    for (let i = 0; i < count && g_ring_count > 0; i++) {
+        out[i * 2]     = g_ring_buf[g_ring_read * 2];
+        out[i * 2 + 1] = g_ring_buf[g_ring_read * 2 + 1];
+        g_ring_read = (g_ring_read + 1) % AUDIO_BUFFER_SIZE;
+        g_ring_count--;
+        read_count++;
+    }
+    return read_count;
+}
+
+function audio_ring_available() {
+    return g_ring_count;
+}
+
+function audio_buffer_init() {
+    if (g_audio_initialized) return;
+    g_audio_buffer.fill(0);
+    g_audio_write_pos = 0;
+    g_audio_read_pos  = 0;
+    g_audio_count     = 0;
+    g_audio_resample_pos     = 0.0;
+    g_audio_time_accumulator = 0.0;
+    g_last_frame_time = audio_get_time_us();
+    g_audio_initialized = true;
+}
+
+// Audio "thread" — setInterval fires every 5 ms (replaces pthread background thread)
+function audio_thread_start() {
+    if (g_audio_thread_running) return;
+    g_audio_thread_running = true;
+    const samples_per_generate = 256;
+    g_audio_interval_id = setInterval(() => {
+        if (!g_audio_thread_running) {
+            clearInterval(g_audio_interval_id);
+            g_audio_interval_id = null;
+            return;
+        }
+        if (g_generate_audio_fn) {
+            g_generate_audio_fn(samples_per_generate);
+        }
+    }, 5);
+}
+
+function audio_thread_stop() {
+    if (!g_audio_thread_running) return;
+    g_audio_thread_running = false;
+    if (g_audio_interval_id !== null) {
+        clearInterval(g_audio_interval_id);
+        g_audio_interval_id = null;
+    }
+}
+
+function resample_audio(input, input_samples, output, max_output, ratio, pos_ref) {
+    if (ratio <= 0) ratio = 1.0;
+    let out_idx = 0;
+    let src_pos = pos_ref[0];
+    while (src_pos < input_samples - 1 && out_idx < max_output) {
+        const idx0  = src_pos | 0;
+        const idx1  = idx0 + 1 < input_samples ? idx0 + 1 : idx0;
+        const frac  = src_pos - idx0;
+        output[out_idx * 2]     = (input[idx0 * 2]     * (1 - frac) + input[idx1 * 2]     * frac) | 0;
+        output[out_idx * 2 + 1] = (input[idx0 * 2 + 1] * (1 - frac) + input[idx1 * 2 + 1] * frac) | 0;
+        src_pos += ratio;
+        out_idx++;
+    }
+    pos_ref[0] = src_pos - input_samples;
+    return out_idx;
+}
+
+/**
+ * Queue stereo int16 samples (called from media.c / audio generation).
+ * @param {Int16Array} samples - interleaved L/R
+ * @param {number} count       - total sample count (pairs * 2)
+ */
+export function sdl_audio_queue_samples(samples, count) {
+    if (!samples || count === 0) return;
+    audio_buffer_init();
+
+    if (g_audio_thread_running) {
+        audio_ring_write(samples, count / 2);
+    }
+
+    if (g_audio_resample_ratio !== 1.0 && g_audio_resample_ratio > 0) {
+        const max_output = Math.ceil(count / g_audio_resample_ratio) + 16;
+        const resampled  = new Int16Array(max_output * 2);
+        const pos_ref    = [g_audio_resample_pos];
+        const out_count  = resample_audio(samples, count / 2, resampled, max_output, g_audio_resample_ratio, pos_ref);
+        g_audio_resample_pos = pos_ref[0];
+        for (let i = 0; i < out_count; i++) {
+            if (g_audio_count >= AUDIO_BUFFER_SIZE) {
+                g_audio_read_pos = (g_audio_read_pos + 1) % AUDIO_BUFFER_SIZE;
+                g_audio_count--;
+            }
+            g_audio_buffer[g_audio_write_pos * 2]     = resampled[i * 2];
+            g_audio_buffer[g_audio_write_pos * 2 + 1] = resampled[i * 2 + 1];
+            g_audio_write_pos = (g_audio_write_pos + 1) % AUDIO_BUFFER_SIZE;
+            g_audio_count++;
+        }
+        return;
+    }
+
+    const samples_to_write = count / 2;
+    for (let i = 0; i < samples_to_write; i++) {
+        if (g_audio_count >= AUDIO_BUFFER_SIZE) {
+            g_audio_read_pos = (g_audio_read_pos + 1) % AUDIO_BUFFER_SIZE;
+            g_audio_count--;
+        }
+        g_audio_buffer[g_audio_write_pos * 2]     = samples[i * 2];
+        g_audio_buffer[g_audio_write_pos * 2 + 1] = samples[i * 2 + 1];
+        g_audio_write_pos = (g_audio_write_pos + 1) % AUDIO_BUFFER_SIZE;
+        g_audio_count++;
+    }
+}
+
+/** @returns {number} */
+export function sdl_audio_get_queued_size() {
+    if (g_audio_thread_running) return audio_ring_available();
+    return g_audio_count;
+}
+
+export function libretro_set_sample_rate(rate) {
+    g_frontend_sample_rate   = rate;
+    g_audio_resample_ratio   = AUDIO_SOURCE_RATE / rate;
+    g_audio_time_accumulator = 0.0;
+    g_last_frame_time = audio_get_time_us();
+}
+
+export function libretro_set_fps(fps) { /* no-op */ }
+
+const g_audio_output_buffer = new Int16Array(AUDIO_BUFFER_SIZE * 2);
+
+/**
+ * Called once per libretro frame to flush audio to the frontend.
+ */
+export function libretro_process_audio() {
+    if (!g_callbacks || !g_callbacks.audio_batch_cb) return;
+
+    if (!g_audio_thread_running) {
+        audio_buffer_init();
+        audio_thread_start();
+    }
+
+    const current_time = audio_get_time_us();
+    let elapsed_us = current_time - g_last_frame_time;
+    g_last_frame_time = current_time;
+    if (elapsed_us < 1000)  elapsed_us = 1000;
+    if (elapsed_us > 100000) elapsed_us = 100000;
+
+    const samples_needed = g_frontend_sample_rate * elapsed_us / 1000000;
+    g_audio_time_accumulator += samples_needed;
+    let samples_to_send = g_audio_time_accumulator | 0;
+    if (samples_to_send < 1) return;
+    g_audio_time_accumulator -= samples_to_send;
+    if (samples_to_send > 2048) samples_to_send = 2048;
+
+    const available        = audio_ring_available();
+    const legacy_available = g_audio_count;
+
+    if (available > 0) {
+        if (samples_to_send > available) samples_to_send = available;
+        const read_count = audio_ring_read(g_audio_output_buffer, samples_to_send);
+        if (read_count > 0) {
+            g_callbacks.audio_batch_cb(g_audio_output_buffer, read_count);
+        }
+    } else if (legacy_available > 0) {
+        if (samples_to_send > legacy_available) samples_to_send = legacy_available;
+        let samples_sent = 0;
+        while (samples_sent < samples_to_send) {
+            const remaining  = samples_to_send - samples_sent;
+            let chunk = remaining > 256 ? 256 : remaining;
+            let contiguous = AUDIO_BUFFER_SIZE - g_audio_read_pos;
+            if (contiguous > chunk)        contiguous = chunk;
+            if (contiguous > g_audio_count) contiguous = g_audio_count;
+            if (contiguous === 0) break;
+            g_callbacks.audio_batch_cb(
+                g_audio_buffer.subarray(g_audio_read_pos * 2, (g_audio_read_pos + contiguous) * 2),
+                contiguous
+            );
+            g_audio_read_pos = (g_audio_read_pos + contiguous) % AUDIO_BUFFER_SIZE;
+            g_audio_count -= contiguous;
+            samples_sent  += contiguous;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Double buffering — framebuffer pair
+// ---------------------------------------------------------------------------
+
+const g_libretro_context = {
+    window: null, renderer: null, texture: null,
+    framebuffer: null, width: 0, height: 0, scale: 1,
+    input: { key_states: new Array(256).fill(false), pointer_x: 0, pointer_y: 0, pointer_pressed: false },
+    audio: { device: 0, frequency: 0, channels: 0, samples: 0, enabled: false },
+    start_time: 0n, frame_time: 0n, target_fps: 30, vsync: false,
+    running: false, minimized: false, fullscreen: false, headless: false, needs_redraw: false,
+    jvm: null,
+};
+
+const g_buffers   = [null, null];
+let g_buffer_width  = 0;
+let g_buffer_height = 0;
+let g_buffer_size   = 0;
+let g_frame_ready   = false;
+
+function init_buffers(width, height) {
+    if (width <= 0 || height <= 0) {
+        process.stderr.write(`[J2ME] Invalid buffer size: ${width}x${height}\n`);
+        return false;
+    }
+    g_buffer_width  = width;
+    g_buffer_height = height;
+    g_buffer_size   = width * height;
+    for (let i = 0; i < BUFFER_COUNT; i++) {
+        g_buffers[i] = new Uint32Array(g_buffer_size);
+    }
+    g_frame_ready = false;
+    g_libretro_context.framebuffer = g_buffers[0];
+    process.stderr.write(`[J2ME] Double buffer initialized: ${width}x${height}\n`);
+    return true;
+}
+
+export function libretro_resize_buffers(width, height) {
+    if (width <= 0 || height <= 0) {
+        process.stderr.write(`[J2ME] Invalid resize dimensions: ${width}x${height}\n`);
+        return false;
+    }
+    if (width === g_buffer_width && height === g_buffer_height) return true;
+    process.stderr.write(`[J2ME] Resizing buffers from ${g_buffer_width}x${g_buffer_height} to ${width}x${height}\n`);
+    g_buffers[0] = null;
+    g_buffers[1] = null;
+    return init_buffers(width, height);
+}
+
+export function libretro_begin_frame() { }
+
+export function libretro_end_frame() {
+    if (!g_buffers[0] || !g_buffers[1]) return;
+    g_buffers[1].set(g_buffers[0]);
+    g_frame_ready = true;
+}
+
+export function libretro_get_display_buffer() {
+    if (!g_buffers[1]) {
+        const fb = g_callbacks ? g_callbacks.get_framebuffer() : null;
+        if (!fb) return null;
+        return {
+            buffer: fb,
+            width:  g_libretro_context.width  > 0 ? g_libretro_context.width  : 240,
+            height: g_libretro_context.height > 0 ? g_libretro_context.height : 320,
+        };
+    }
+    return {
+        buffer: g_buffers[1],
+        width:  g_buffer_width  > 0 ? g_buffer_width  : 240,
+        height: g_buffer_height > 0 ? g_buffer_height : 320,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Context accessors
+// ---------------------------------------------------------------------------
+
+export function sdl_get_global_context() { return g_libretro_context; }
+
+export function sdl_set_global_context(ctx) {
+    if (ctx) {
+        Object.assign(g_libretro_context, ctx);
+    } else {
+        Object.assign(g_libretro_context, {
+            window: null, renderer: null, texture: null,
+            framebuffer: null, width: 0, height: 0, scale: 1,
+            running: false, needs_redraw: false, jvm: null,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Initialization / teardown
+// ---------------------------------------------------------------------------
+
+export function sdl_init(jvm, width, height, scale, headless) {
+    if (width  <= 0) width  = 240;
+    if (height <= 0) height = 320;
+
+    g_libretro_context.jvm        = jvm;
+    g_libretro_context.width      = width;
+    g_libretro_context.height     = height;
+    g_libretro_context.scale      = 1;
+    g_libretro_context.target_fps = 30;
+    g_libretro_context.running    = true;
+
+    if (!init_buffers(width, height)) {
+        const fb = g_callbacks ? g_callbacks.get_framebuffer() : null;
+        if (fb) {
+            g_libretro_context.framebuffer = fb;
+            process.stderr.write(`[J2ME] Using single buffer fallback\n`);
+        } else {
+            process.stderr.write(`[J2ME] ERROR: No framebuffer available!\n`);
+        }
+    }
+
+    audio_buffer_init();
+    audio_thread_start();
+    return 0;
+}
+
+export function sdl_destroy(ctx) {
+    audio_thread_stop();
+    g_buffers[0] = null;
+    g_buffers[1] = null;
+    g_buffer_size = 0;
+    g_ring_write = 0;
+    g_ring_read  = 0;
+    g_ring_count = 0;
+    g_audio_initialized = false;
+    process.stderr.write(`[J2ME] Destroyed\n`);
+}
+
+// ---------------------------------------------------------------------------
+// Event loop / window stubs
+// ---------------------------------------------------------------------------
+
+export function sdl_run(ctx)                              {}
+export function sdl_set_fullscreen(ctx, fullscreen)        {}
+export function sdl_get_ticks(ctx)                         { return 0n; }
+export function sdl_delay(ms)                              {}
+export function sdl_update_screen(ctx)                     {}
+export function sdl_handle_events(ctx)                     {}
+export function sdl_process_events_minimal()               {}
+export function sdl_update_texture(ctx)                    {}
+export function sdl_present(ctx)                           {}
+export function sdl_request_redraw()                       { g_libretro_context.needs_redraw = true; }
+export function sdl_needs_redraw(ctx)                      { return ctx ? ctx.needs_redraw : false; }
+export function sdl_clear_redraw(ctx)                      { if (ctx) ctx.needs_redraw = false; }
+export function sdl_frame_end(ctx)                         {}
+export function sdl_sleep(ms)                              {}
+export function sdl_set_title(ctx, title)                  {}
+export function sdl_toggle_fullscreen(ctx)                 {}
+export function sdl_stop(ctx)                              { if (ctx) ctx.running = false; }
+export function sdl_dump_info(ctx)                         {}
+export function sdl_save_framebuffer_to_file(ctx, filename){}
+export function sdl_get_graphics(ctx)                      { return null; }
+export function sdl_get_platform_callbacks(ctx)            { return null; }
+export function sdl_is_screen_graphics(gfx)               { return true; }
+export function sdl_resize(ctx, width, height)             { return 0; }
+export function sdl_screenshot(ctx, filename)              { return -1; }
+export function sdl_process_events(ctx)                    {}
+export function sdl_key_to_midp(sdl_key)                   { return 0; }
+export function sdl_key_to_game_action(sdl_key)            { return 0; }
+export function sdl_get_pointer(ctx, xOut, yOut) {
+    if (xOut) xOut.value = 0;
+    if (yOut) yOut.value = 0;
+    return [0, 0];
+}
+export function sdl_pointer_pressed(ctx) { return false; }
+
+export function sdl_clear(ctx, color) {
+    if (!ctx || !ctx.framebuffer) return;
+    ctx.framebuffer.fill(color >>> 0);
+}
+
+export function sdl_get_window_size(ctx, widthOut, heightOut) {
+    const w = ctx ? ctx.width  : 0;
+    const h = ctx ? ctx.height : 0;
+    if (widthOut  != null) widthOut.value  = w;
+    if (heightOut != null) heightOut.value = h;
+    return [w, h];
+}
+
+export function sdl_key_pressed(ctx, key) {
+    const keys = g_callbacks ? g_callbacks.get_key_states() : 0;
+    switch (key) {
+        case 1:  return (keys & (1 << 1))  !== 0;
+        case 6:  return (keys & (1 << 6))  !== 0;
+        case 2:  return (keys & (1 << 2))  !== 0;
+        case 5:  return (keys & (1 << 5))  !== 0;
+        case 8:  return (keys & (1 << 8))  !== 0;
+        case 9:  return (keys & (1 << 9))  !== 0;
+        case 10: return (keys & (1 << 10)) !== 0;
+        case 11: return (keys & (1 << 11)) !== 0;
+        case 12: return (keys & (1 << 12)) !== 0;
+        default: return false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audio context stubs
+// ---------------------------------------------------------------------------
+
+export function sdl_audio_init_simple(sample_rate)                { audio_buffer_init(); return 0; }
+export function sdl_audio_init(ctx, frequency, channels, samples) { audio_buffer_init(); return 0; }
+export function sdl_audio_queue(ctx, data, length)                { return 0; }
+export function sdl_audio_queued_size(ctx)                        { return g_audio_count; }
+export function sdl_audio_clear(ctx) {
+    g_audio_read_pos  = 0;
+    g_audio_write_pos = 0;
+    g_audio_count     = 0;
+}
+export function sdl_audio_shutdown() {
+    audio_thread_stop();
+    g_audio_initialized = false;
+    g_audio_write_pos   = 0;
+    g_audio_read_pos    = 0;
+    g_audio_count       = 0;
+    g_ring_write = 0;
+    g_ring_read  = 0;
+    g_ring_count = 0;
+}
+
+// ---------------------------------------------------------------------------
+// JAR resource loading
+// ---------------------------------------------------------------------------
+
+let g_jvm = null;
+export function set_jvm(jvm) { g_jvm = jvm; }
+
+export function load_jar_resource(path) {
+    if (!path || !g_jvm) return null;
+    const class_loader = g_jvm.class_loader;
+    if (!class_loader) return null;
+    const jar_raw = class_loader.jar_data;
+    if (!jar_raw) return null;
+    const jar = jar_raw instanceof Uint8Array ? jar_raw : new Uint8Array(jar_raw);
+    const jar_size = jar.length;
+
+    const read_u16 = (off) => jar[off] | (jar[off + 1] << 8);
+    const read_u32 = (off) => (jar[off] | (jar[off+1] << 8) | (jar[off+2] << 16) | (jar[off+3] << 24)) >>> 0;
+
+    let eocd = 0;
+    for (let i = jar_size - 22; i > 0; i--) {
+        if (jar[i] === 0x50 && jar[i+1] === 0x4B && jar[i+2] === 0x05 && jar[i+3] === 0x06) {
+            eocd = i;
+            break;
+        }
+    }
+    if (eocd === 0) return null;
+
+    const cd_start   = read_u32(eocd + 16);
+    const cd_entries = read_u16(eocd + 10);
+
+    let cde = cd_start;
+    for (let i = 0; i < cd_entries && cde < eocd; i++) {
+        const sig = read_u32(cde);
+        if (sig !== 0x02014B50) break;
+
+        const compression = read_u16(cde + 10);
+        const comp_size   = read_u32(cde + 20);
+        const uncomp_size = read_u32(cde + 24);
+        const name_len    = read_u16(cde + 28);
+        const extra_len   = read_u16(cde + 30);
+        const comment_len = read_u16(cde + 32);
+        const local_off   = read_u32(cde + 42);
+
+        let match = (name_len === path.length);
+        if (match) {
+            for (let k = 0; k < name_len; k++) {
+                if (jar[cde + 46 + k] !== path.charCodeAt(k)) { match = false; break; }
+            }
+        }
+
+        if (match) {
+            const local_name_len  = read_u16(local_off + 26);
+            const local_extra_len = read_u16(local_off + 28);
+            const data_off = local_off + 30 + local_name_len + local_extra_len;
+
+            if (compression === 0) {
+                return jar.slice(data_off, data_off + uncomp_size);
+            } else if (compression === 8) {
+                try {
+                    const compressed   = jar.slice(data_off, data_off + comp_size);
+                    const decompressed = inflateRawSync(compressed);
+                    return new Uint8Array(decompressed);
+                } catch (e) {
+                    process.stderr.write(`[J2ME] inflate failed for ${path}: ${e.message}\n`);
+                    return null;
+                }
+            }
+        }
+
+        cde += 46 + name_len + extra_len + comment_len;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Error display state
+// ---------------------------------------------------------------------------
+
+let g_error_title   = '';
+let g_error_message = '';
+let g_error_stack   = '';
+let g_error_extra   = '';
+let g_has_error     = false;
+
+export function sdl_set_error_info(title, message, stack_trace) {
+    g_has_error = true;
+    if (title       != null) g_error_title   = String(title);
+    if (message     != null) g_error_message = String(message);
+    if (stack_trace != null) g_error_stack   = String(stack_trace);
+
+    process.stderr.write(`\n========================================\n`);
+    process.stderr.write(`  [J2ME UNCAUGHT EXCEPTION]\n`);
+    process.stderr.write(`========================================\n`);
+    process.stderr.write(`  Exception: ${g_error_title}\n`);
+    if (g_error_message) process.stderr.write(`  Message:   ${g_error_message}\n`);
+    if (g_error_extra)   process.stderr.write(`  Details:   ${g_error_extra}\n`);
+    if (g_error_stack)   process.stderr.write(`  Stack:\n${g_error_stack}`);
+    process.stderr.write(`========================================\n\n`);
+}
+
+export function sdl_set_error_extra(extra) {
+    g_error_extra = (extra != null) ? String(extra) : '';
+}
+
+export function sdl_has_error() { return g_has_error; }
+
+export function sdl_clear_error() {
+    g_has_error     = false;
+    g_error_title   = '';
+    g_error_message = '';
+    g_error_stack   = '';
+    g_error_extra   = '';
+}
+
+// ---------------------------------------------------------------------------
+// Error screen renderer
+// ---------------------------------------------------------------------------
+
+function draw_char_fb(fb, fb_width, fb_height, x, y, char_data, color) {
+    for (let row = 0; row < FONT_HEIGHT; row++) {
+        const row_data = char_data[row];
+        for (let col = 0; col < FONT_WIDTH; col++) {
+            if (row_data & (1 << (4 - col))) {
+                const px = x + col;
+                const py = y + row;
+                if (px >= 0 && px < fb_width && py >= 0 && py < fb_height) {
+                    fb[py * fb_width + px] = color;
+                }
+            }
+        }
+    }
+}
+
+function draw_string_fb(fb, fb_width, fb_height, xRef, yRef, str, color, max_width) {
+    if (!str || !fb) return;
+    const start_x = xRef[0];
+    const char_w  = FONT_WIDTH + 1;
+    let i = 0;
+    while (i < str.length) {
+        const { cp, next } = utf8_decode(str, i);
+        i = next;
+        if (cp < 0) continue;
+        if (cp === 0x0A) {
+            xRef[0] = start_x;
+            yRef[0] += FONT_HEIGHT + 2;
+            continue;
+        }
+        if (xRef[0] + char_w >= start_x + max_width) {
+            xRef[0] = start_x;
+            yRef[0] += FONT_HEIGHT + 2;
+        }
+        if (yRef[0] + FONT_HEIGHT >= fb_height - 10) break;
+        draw_char_fb(fb, fb_width, fb_height, xRef[0], yRef[0], get_char_data_unicode(cp), color);
+        xRef[0] += char_w;
+    }
+    yRef[0] += FONT_HEIGHT + 2;
+}
+
+function draw_hline_fb(fb, fb_width, y, x1, x2, color) {
+    if (y < 0) return;
+    for (let x = x1; x < x2 && x < fb_width; x++) {
+        if (x >= 0) fb[y * fb_width + x] = color;
+    }
+}
+
+export function sdl_draw_error_screen(ctx) {
+    if (!ctx || !ctx.framebuffer) return;
+    const width  = ctx.width  > 0 ? ctx.width  : 240;
+    const height = ctx.height > 0 ? ctx.height : 320;
+    const fb     = ctx.framebuffer;
+
+    const bg_color     = 0xFF1A1A2E;
+    const header_bg    = 0xFF16213E;
+    const border_color = 0xFFE94560;
+    const exc_color    = 0xFFFF6B6B;
+    const msg_color    = 0xFFFFFF00;
+    const detail_color = 0xFF87CEEB;
+    const stack_color  = 0xFFCCCCCC;
+    const throw_color  = 0xFFFF6B6B;
+    const help_color   = 0xFF888888;
+
+    fb.fill(bg_color);
+
+    for (let hy = 0; hy < 14; hy++) draw_hline_fb(fb, width, hy, 0, width, header_bg);
+    draw_hline_fb(fb, width, 0,          0, width, border_color);
+    draw_hline_fb(fb, width, 13,         0, width, border_color);
+    draw_hline_fb(fb, width, height - 1, 0, width, border_color);
+
+    const xR = [5];
+    const yR = [3];
+
+    draw_string_fb(fb, width, height, xR, yR, '!! EXCEPTION !!', exc_color, width - 10);
+    yR[0] += 4;
+
+    if (g_error_title) {
+        xR[0] = 5;
+        draw_string_fb(fb, width, height, xR, yR, g_error_title, exc_color, width - 10);
+        yR[0] += 2;
+    }
+
+    draw_hline_fb(fb, width, yR[0], 2, width - 2, 0xFF333355);
+    yR[0] += 4;
+
+    if (g_error_message) {
+        xR[0] = 5;
+        draw_string_fb(fb, width, height, xR, yR, 'Msg:', detail_color, width - 10);
+        xR[0] = 5;
+        draw_string_fb(fb, width, height, xR, yR, g_error_message, msg_color, width - 10);
+        yR[0] += 2;
+    }
+
+    if (g_error_extra) {
+        xR[0] = 5;
+        draw_string_fb(fb, width, height, xR, yR, g_error_extra, detail_color, width - 10);
+        yR[0] += 2;
+    }
+
+    draw_hline_fb(fb, width, yR[0], 2, width - 2, 0xFF333355);
+    yR[0] += 4;
+
+    if (g_error_stack) {
+        const lines = g_error_stack.split('\n');
+        for (let ln = 0; ln < lines.length; ln++) {
+            if (yR[0] + FONT_HEIGHT >= height - 18) {
+                xR[0] = 5;
+                const rem = lines.length - ln;
+                draw_string_fb(fb, width, height, xR, yR,
+                    '  ... +' + rem + ' more frames', help_color, width - 10);
+                break;
+            }
+            xR[0] = 5;
+            draw_string_fb(fb, width, height, xR, yR, lines[ln],
+                ln === 0 ? throw_color : stack_color, width - 10);
+        }
+    }
+
+    yR[0] = height - 15;
+    xR[0] = 5;
+    draw_string_fb(fb, width, height, xR, yR, 'SELECT=exit', help_color, width - 10);
+}
